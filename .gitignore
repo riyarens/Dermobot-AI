@@ -3,3 +3,5 @@ dist/
 .env
 .env.local
 .env.*.local
+server/uploads/processed/*
+!server/uploads/processed/.gitkeep

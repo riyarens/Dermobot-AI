@@ -1,11 +1,12 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth'
-import { ArrowRight, Check, Eye, EyeOff, FlaskConical, Leaf, LockKeyhole, LogOut, Mail, ShieldCheck, Sparkles } from 'lucide-react'
-import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { ArrowRight, Check, Eye, EyeOff, FlaskConical, ImagePlus, Leaf, LockKeyhole, LogOut, Mail, ShieldCheck, Sparkles, Upload, X, Copy, RotateCcw } from 'lucide-react'
+import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import { auth, firebaseConfigured } from './firebase'
 
 type Mode = 'login' | 'signup'
+type IngredientScreening = { ingredient: string; level: 'low' | 'medium' | 'high'; confidence: 'low' | 'medium' | 'high'; reason: string }
 
 function Brand() {
   return <a className="brand" href="/" aria-label="Dermobot home">
@@ -171,7 +172,96 @@ function DashboardPage() {
   const location = useLocation()
   const [loggingOut, setLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState('')
+  const [selectedImage, setSelectedImage] = useState<File | null>(null)
+  const [preview, setPreview] = useState('')
+  const [ocrLoading, setOcrLoading] = useState(false)
+  const [ocrError, setOcrError] = useState('')
+  const [extractedText, setExtractedText] = useState('')
+  const [dragging, setDragging] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [analysis, setAnalysis] = useState<IngredientScreening[] | null>(null)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [analysisError, setAnalysisError] = useState('')
+  const fileInput = useRef<HTMLInputElement>(null)
   const signupSuccess = (location.state as { signupSuccess?: boolean } | null)?.signupSuccess
+
+  function chooseImage(file?: File) {
+    setOcrError('')
+    setCopied(false)
+    if (!file) return
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setOcrError('Choose a JPG, PNG, or WEBP image.')
+      return
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setOcrError('That image is larger than 10 MB. Choose a smaller file.')
+      return
+    }
+    if (preview) URL.revokeObjectURL(preview)
+    setSelectedImage(file)
+    setPreview(URL.createObjectURL(file))
+    setExtractedText('')
+    setAnalysis(null)
+    setAnalysisError('')
+  }
+
+  async function extractIngredients() {
+    if (!selectedImage || ocrLoading) return
+    setOcrLoading(true)
+    setOcrError('')
+    setExtractedText('')
+    setAnalysis(null)
+    try {
+      if (!auth?.currentUser) throw new Error('Your session has expired. Please sign in again.')
+      const token = await auth.currentUser.getIdToken()
+      const imageData = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result.split(',')[1] ?? '') : reject(new Error('Could not read image'))
+        reader.onerror = () => reject(new Error('Could not read image'))
+        reader.readAsDataURL(selectedImage)
+      })
+      const response = await fetch('/api/extract', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ image: imageData, mimeType: selectedImage.type }) })
+      const payload = await response.json() as { text?: string; error?: string }
+      if (!response.ok) throw new Error(payload.error || 'OCR request failed')
+      const text = (payload.text ?? '').trim()
+      if (!text) setOcrError('No readable text was found. Try a sharper, well-lit photo with the ingredient list in focus.')
+      else setExtractedText(text)
+    } catch (caught) {
+      setOcrError(caught instanceof Error ? caught.message : 'We could not read this image. Please try again or upload a clearer photo.')
+    } finally {
+      setOcrLoading(false)
+    }
+  }
+
+  async function analyzeIngredients() {
+    if (!extractedText.trim() || analysisLoading) return
+    setAnalysisLoading(true)
+    setAnalysisError('')
+    setAnalysis(null)
+    try {
+      if (!auth?.currentUser) throw new Error('Your session has expired. Please sign in again.')
+      const token = await auth.currentUser.getIdToken()
+      const response = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ text: extractedText }) })
+      const payload = await response.json() as { items?: IngredientScreening[]; error?: string }
+      if (!response.ok) throw new Error(payload.error || 'Ingredient screening failed')
+      setAnalysis(payload.items ?? [])
+    } catch (caught) {
+      setAnalysisError(caught instanceof Error ? caught.message : 'Could not analyze these ingredients. Please retry.')
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }
+
+  async function copyIngredients() {
+    try { await navigator.clipboard.writeText(extractedText); setCopied(true); window.setTimeout(() => setCopied(false), 1800) }
+    catch { setOcrError('Clipboard access is unavailable. Select and copy the text manually.') }
+  }
+
+  function resetScan() {
+    if (preview) URL.revokeObjectURL(preview)
+    setSelectedImage(null); setPreview(''); setExtractedText(''); setOcrError(''); setAnalysis(null); setAnalysisError('')
+    if (fileInput.current) fileInput.current.value = ''
+  }
 
   async function handleLogout() {
     if (!auth) return
@@ -187,12 +277,25 @@ function DashboardPage() {
   }
 
   return <main className="dashboard-shell">
-    <header className="dashboard-header"><Brand /><div className="dashboard-user"><span className="user-avatar">{(user?.displayName || user?.email || 'D').charAt(0).toUpperCase()}</span><span className="user-email">{user?.displayName || user?.email}</span><button type="button" onClick={() => void handleLogout()} disabled={loggingOut} className="logout-button"><LogOut size={16} />{loggingOut ? 'Signing out...' : 'Log out'}</button></div></header>
-    <section className="dashboard-content">
-      <div className="dashboard-welcome"><span className="welcome-tag"><Sparkles size={13} /> DERMOBOT ACCOUNT</span><h1>{signupSuccess ? 'Your account is ready.' : 'Welcome back.'}</h1><p>Your Firebase Authentication session is active.</p></div>
+    <header className="dashboard-header"><Brand /><nav className="dashboard-nav" aria-label="Main navigation"><Link to="/dashboard" aria-current="page">Dashboard</Link></nav><div className="dashboard-user"><span className="user-avatar">{(user?.displayName || user?.email || 'D').charAt(0).toUpperCase()}</span><span className="user-email">{user?.displayName || user?.email}</span><button type="button" onClick={() => void handleLogout()} disabled={loggingOut} className="logout-button"><LogOut size={16} />{loggingOut ? 'Signing out...' : 'Log out'}</button></div></header>
+    <section className="dashboard-content scanner-content">
+      <div className="dashboard-welcome"><span className="welcome-tag"><Sparkles size={13} /> YOUR SKINCARE, MADE CLEAR</span><h1>Know What Goes Into<br className="desktop-break" /> Your Skincare.</h1><p>Upload a product ingredient list, review the extracted text, then get a general AI screening of potential ingredient concerns.</p></div>
       {signupSuccess && <p className="auth-message success" role="status"><Check size={16} /> Your Dermobot account was created successfully.</p>}
       {logoutError && <p className="auth-message error" role="alert">{logoutError}</p>}
-      <div className="auth-session-card"><ShieldCheck size={21} /><div><strong>Signed in</strong><span>{user?.email}</span></div></div>
+      <section className="scanner-card" aria-labelledby="scan-title">
+        <div className="scanner-card-heading"><span className="upload-icon"><ImagePlus size={20} /></span><div><h2 id="scan-title">Scan Your Ingredient List</h2><p>Upload a clear photo of the ingredients printed on your product packaging.</p></div></div>
+        <div className={`drop-zone ${dragging ? 'drop-zone-active' : ''} ${preview ? 'has-preview' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); chooseImage(event.dataTransfer.files[0]) }}>
+          <input ref={fileInput} className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" onChange={(event) => chooseImage(event.target.files?.[0])} />
+          {preview ? <><img src={preview} alt="Selected ingredient list preview" className="image-preview" /><button type="button" className="remove-image" aria-label="Remove selected image" onClick={resetScan}><X size={16} /></button><div className="preview-name">{selectedImage?.name}</div></> : <><span className="drop-icon"><Upload size={21} /></span><strong>Drop your image here</strong><span className="drop-support">or browse a file from your device</span><button className="browse-button" type="button" onClick={() => fileInput.current?.click()}>Choose image</button></>}
+        </div>
+        <div className="upload-meta"><span>JPG, PNG, WEBP</span><span>Maximum file size: 10 MB</span></div>
+        {ocrError && <p className="auth-message error scanner-message" role="alert">{ocrError}</p>}
+        <button type="button" className="extract-button" disabled={!selectedImage || ocrLoading} onClick={() => void extractIngredients()}>{ocrLoading ? <><span className="button-spinner" /> Reading your ingredient list...</> : <><Sparkles size={16} /> Extract Ingredients <ArrowRight size={16} /></>}</button>
+      </section>
+      <section className="results-card" aria-labelledby="results-title">
+        <div className="results-heading"><div><span className="results-kicker">YOUR SCAN</span><h2 id="results-title">Extracted Ingredients</h2></div>{extractedText && <button type="button" className="copy-button" onClick={() => void copyIngredients()}><Copy size={14} />{copied ? 'Copied' : 'Copy Ingredients'}</button>}</div>
+        {extractedText ? <><p className="results-note">Check the transcription against the package. For best results, upload a sharp, well-lit image with the full ingredient list in frame.</p><pre className="extracted-text extracted-readonly" aria-label="Extracted ingredient text">{extractedText}</pre><div className="result-footer"><span>Image text extracted by Gemini</span><button className="reset-button" type="button" onClick={resetScan}><RotateCcw size={14} /> Scan another image</button></div><div className="analysis-action"><div><strong>Ingredient screening</strong><span>Get a general AI estimate of potential concerns.</span></div><button className="extract-button analyze-button" type="button" disabled={analysisLoading || !extractedText.trim()} onClick={() => void analyzeIngredients()}>{analysisLoading ? <><span className="button-spinner" /> Reviewing ingredients...</> : <><ShieldCheck size={16} /> Categorize risks <ArrowRight size={16} /></>}</button></div>{analysisError && <p className="auth-message error scanner-message" role="alert">{analysisError}</p>}{analysis && <div className="analysis-results"><div className="analysis-summary"><strong>Potential concern screening</strong><span>{analysis.length} ingredients reviewed</span></div><div className="analysis-totals"><span className="screening-badge screening-low">Low {analysis.filter((item) => item.level === 'low').length}</span><span className="screening-badge screening-medium">Medium {analysis.filter((item) => item.level === 'medium').length}</span><span className="screening-badge screening-high">High {analysis.filter((item) => item.level === 'high').length}</span></div><p className="analysis-disclaimer">AI-generated general screening only. Ingredient risk depends on concentration, formula, how the product is used, and individual sensitivity. This is not medical advice or a regulatory assessment.</p><div className="ingredient-screenings">{analysis.map((item, index) => <article className="ingredient-screening" key={`${index}-${item.ingredient}`}><div className="ingredient-screening-title"><strong>{item.ingredient}</strong><span className={`screening-badge screening-${item.level}`}>{item.level} potential concern</span></div><p>{item.reason}</p><span className="screening-confidence">AI confidence: {item.confidence}</span></article>)}</div><button type="button" className="reset-button rerun-button" onClick={() => void analyzeIngredients()} disabled={analysisLoading}><RotateCcw size={14} /> Re-run screening</button></div>}</> : <div className="results-empty"><span className="empty-result-icon"><FlaskConical size={19} /></span><strong>Your extracted text will appear here</strong><span>Upload an ingredient list image to get started. The transcription appears here for reference and copying.</span></div>}
+      </section>
     </section>
   </main>
 }
