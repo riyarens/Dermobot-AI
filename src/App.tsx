@@ -1,12 +1,19 @@
-import { useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth'
 import { ArrowRight, Check, Eye, EyeOff, FlaskConical, ImagePlus, Leaf, LockKeyhole, LogOut, Mail, ShieldCheck, Sparkles, Upload, X, Copy, RotateCcw } from 'lucide-react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthContext'
-import { auth, firebaseConfigured } from './firebase'
+import { auth, db, firebaseConfigured } from './firebase'
+import {
+  type IngredientScreening,
+  type ScanRecord,
+  calculateSafetyScore,
+  getUserScanHistory,
+  saveScanRecord,
+} from './lib/scanService'
 
 type Mode = 'login' | 'signup'
-type IngredientScreening = { ingredient: string; level: 'low' | 'medium' | 'high'; confidence: 'low' | 'medium' | 'high'; reason: string }
+
 
 function Brand() {
   return <a className="brand" href="/" aria-label="Dermobot home">
@@ -182,12 +189,46 @@ function DashboardPage() {
   const [analysis, setAnalysis] = useState<IngredientScreening[] | null>(null)
   const [analysisLoading, setAnalysisLoading] = useState(false)
   const [analysisError, setAnalysisError] = useState('')
+  const [productName, setProductName] = useState('')
+  const [brand, setBrand] = useState('')
+  const [savingScan, setSavingScan] = useState(false)
+  const [saveMessage, setSaveMessage] = useState('')
+  const [scans, setScans] = useState<ScanRecord[]>([])
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState('')
+  const [viewingSavedScan, setViewingSavedScan] = useState<ScanRecord | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
+  const savedScanSignature = useRef<string>('')
   const signupSuccess = (location.state as { signupSuccess?: boolean } | null)?.signupSuccess
+
+  function loadHistory() {
+    if (!user || !db) {
+      setHistoryLoading(false)
+      return
+    }
+    setHistoryLoading(true)
+    setHistoryError('')
+    getUserScanHistory(db, user.uid)
+      .then((records) => {
+        setScans(records)
+      })
+      .catch((err) => {
+        console.error('Error fetching scan history:', err)
+        setHistoryError('Could not load scan history. Make sure Cloud Firestore is enabled in your Firebase Console.')
+      })
+      .finally(() => {
+        setHistoryLoading(false)
+      })
+  }
+
+  useEffect(() => {
+    loadHistory()
+  }, [user])
 
   function chooseImage(file?: File) {
     setOcrError('')
     setCopied(false)
+    setViewingSavedScan(null)
     if (!file) return
     if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
       setOcrError('Choose a JPG, PNG, or WEBP image.')
@@ -203,6 +244,10 @@ function DashboardPage() {
     setExtractedText('')
     setAnalysis(null)
     setAnalysisError('')
+    if (!productName.trim()) {
+      const suggestedName = file.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ')
+      setProductName(suggestedName)
+    }
   }
 
   async function extractIngredients() {
@@ -211,6 +256,7 @@ function DashboardPage() {
     setOcrError('')
     setExtractedText('')
     setAnalysis(null)
+    setViewingSavedScan(null)
     try {
       if (!auth?.currentUser) throw new Error('Your session has expired. Please sign in again.')
       const token = await auth.currentUser.getIdToken()
@@ -244,7 +290,37 @@ function DashboardPage() {
       const response = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ text: extractedText }) })
       const payload = await response.json() as { items?: IngredientScreening[]; error?: string }
       if (!response.ok) throw new Error(payload.error || 'Ingredient screening failed')
-      setAnalysis(payload.items ?? [])
+      const items = payload.items ?? []
+      setAnalysis(items)
+
+      // Save scan results to Firestore if not already saved (prevents duplicate saves)
+      if (auth.currentUser && db && items.length > 0) {
+        const fallbackName = selectedImage?.name
+          ? selectedImage.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ')
+          : 'Product Scan'
+        const finalProdName = productName.trim() || fallbackName
+        const currentSignature = `${auth.currentUser.uid}_${extractedText.trim()}_${finalProdName}_${brand.trim()}`
+        if (savedScanSignature.current !== currentSignature) {
+          try {
+            setSavingScan(true)
+            const savedRecord = await saveScanRecord(db, auth.currentUser.uid, {
+              productName: finalProdName,
+              brand: brand.trim(),
+              extractedText,
+              riskClassifications: items,
+            })
+            savedScanSignature.current = currentSignature
+            setScans((prev) => [savedRecord, ...prev.filter((s) => s.id !== savedRecord.id)])
+            setSaveMessage('Saved to your scan history')
+            window.setTimeout(() => setSaveMessage(''), 3000)
+          } catch (saveErr) {
+            console.error('Failed to save scan to Firestore:', saveErr)
+            setSaveMessage('Could not save to history. Verify Firestore is enabled in your project.')
+          } finally {
+            setSavingScan(false)
+          }
+        }
+      }
     } catch (caught) {
       setAnalysisError(caught instanceof Error ? caught.message : 'Could not analyze these ingredients. Please retry.')
     } finally {
@@ -259,8 +335,46 @@ function DashboardPage() {
 
   function resetScan() {
     if (preview) URL.revokeObjectURL(preview)
-    setSelectedImage(null); setPreview(''); setExtractedText(''); setOcrError(''); setAnalysis(null); setAnalysisError('')
+    setSelectedImage(null)
+    setPreview('')
+    setExtractedText('')
+    setOcrError('')
+    setAnalysis(null)
+    setAnalysisError('')
+    setViewingSavedScan(null)
+    setProductName('')
+    setBrand('')
+    setSaveMessage('')
     if (fileInput.current) fileInput.current.value = ''
+  }
+
+  function openSavedScan(scan: ScanRecord) {
+    setViewingSavedScan(scan)
+    setExtractedText(scan.extractedText || scan.ingredients.join(', '))
+    setAnalysis(scan.riskClassifications)
+    setProductName(scan.productName)
+    setBrand(scan.brand)
+    setOcrError('')
+    setAnalysisError('')
+    savedScanSignature.current = `${user?.uid}_${(scan.extractedText || '').trim()}_${scan.productName.trim()}_${scan.brand.trim()}`
+    const resultsEl = document.getElementById('results-card')
+    if (resultsEl) {
+      resultsEl.scrollIntoView({ behavior: 'smooth' })
+    }
+  }
+
+  function closeSavedScan() {
+    setViewingSavedScan(null)
+    resetScan()
+  }
+
+  function formatScanDate(millis: number) {
+    if (!millis) return ''
+    return new Date(millis).toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    })
   }
 
   async function handleLogout() {
@@ -289,12 +403,142 @@ function DashboardPage() {
           {preview ? <><img src={preview} alt="Selected ingredient list preview" className="image-preview" /><button type="button" className="remove-image" aria-label="Remove selected image" onClick={resetScan}><X size={16} /></button><div className="preview-name">{selectedImage?.name}</div></> : <><span className="drop-icon"><Upload size={21} /></span><strong>Drop your image here</strong><span className="drop-support">or browse a file from your device</span><button className="browse-button" type="button" onClick={() => fileInput.current?.click()}>Choose image</button></>}
         </div>
         <div className="upload-meta"><span>JPG, PNG, WEBP</span><span>Maximum file size: 10 MB</span></div>
+        <div className="product-meta-inputs">
+          <div className="meta-input-field">
+            <label htmlFor="prod-name">Product Name (optional)</label>
+            <input
+              id="prod-name"
+              type="text"
+              placeholder="e.g. Daily Glow Serum"
+              value={productName}
+              onChange={(e) => setProductName(e.target.value)}
+              disabled={ocrLoading || analysisLoading}
+            />
+          </div>
+          <div className="meta-input-field">
+            <label htmlFor="prod-brand">Brand / Manufacturer (optional)</label>
+            <input
+              id="prod-brand"
+              type="text"
+              placeholder="e.g. CeraVe, The Ordinary"
+              value={brand}
+              onChange={(e) => setBrand(e.target.value)}
+              disabled={ocrLoading || analysisLoading}
+            />
+          </div>
+        </div>
         {ocrError && <p className="auth-message error scanner-message" role="alert">{ocrError}</p>}
         <button type="button" className="extract-button" disabled={!selectedImage || ocrLoading} onClick={() => void extractIngredients()}>{ocrLoading ? <><span className="button-spinner" /> Reading your ingredient list...</> : <><Sparkles size={16} /> Extract Ingredients <ArrowRight size={16} /></>}</button>
       </section>
-      <section className="results-card" aria-labelledby="results-title">
+      <section className="results-card" id="results-card" aria-labelledby="results-title">
         <div className="results-heading"><div><span className="results-kicker">YOUR SCAN</span><h2 id="results-title">Extracted Ingredients</h2></div>{extractedText && <button type="button" className="copy-button" onClick={() => void copyIngredients()}><Copy size={14} />{copied ? 'Copied' : 'Copy Ingredients'}</button>}</div>
-        {extractedText ? <><p className="results-note">Check the transcription against the package. For best results, upload a sharp, well-lit image with the full ingredient list in frame.</p><pre className="extracted-text extracted-readonly" aria-label="Extracted ingredient text">{extractedText}</pre><div className="result-footer"><span>Image text extracted by Gemini</span><button className="reset-button" type="button" onClick={resetScan}><RotateCcw size={14} /> Scan another image</button></div><div className="analysis-action"><div><strong>Ingredient screening</strong><span>Get a general AI estimate of potential concerns.</span></div><button className="extract-button analyze-button" type="button" disabled={analysisLoading || !extractedText.trim()} onClick={() => void analyzeIngredients()}>{analysisLoading ? <><span className="button-spinner" /> Reviewing ingredients...</> : <><ShieldCheck size={16} /> Categorize risks <ArrowRight size={16} /></>}</button></div>{analysisError && <p className="auth-message error scanner-message" role="alert">{analysisError}</p>}{analysis && <div className="analysis-results"><div className="analysis-summary"><strong>Potential concern screening</strong><span>{analysis.length} ingredients reviewed</span></div><div className="analysis-totals"><span className="screening-badge screening-low">Low {analysis.filter((item) => item.level === 'low').length}</span><span className="screening-badge screening-medium">Medium {analysis.filter((item) => item.level === 'medium').length}</span><span className="screening-badge screening-high">High {analysis.filter((item) => item.level === 'high').length}</span></div><p className="analysis-disclaimer">AI-generated general screening only. Ingredient risk depends on concentration, formula, how the product is used, and individual sensitivity. This is not medical advice or a regulatory assessment.</p><div className="ingredient-screenings">{analysis.map((item, index) => <article className="ingredient-screening" key={`${index}-${item.ingredient}`}><div className="ingredient-screening-title"><strong>{item.ingredient}</strong><span className={`screening-badge screening-${item.level}`}>{item.level} potential concern</span></div><p>{item.reason}</p><span className="screening-confidence">AI confidence: {item.confidence}</span></article>)}</div><button type="button" className="reset-button rerun-button" onClick={() => void analyzeIngredients()} disabled={analysisLoading}><RotateCcw size={14} /> Re-run screening</button></div>}</> : <div className="results-empty"><span className="empty-result-icon"><FlaskConical size={19} /></span><strong>Your extracted text will appear here</strong><span>Upload an ingredient list image to get started. The transcription appears here for reference and copying.</span></div>}
+        {viewingSavedScan && (
+          <div className="saved-scan-banner" role="status">
+            <div className="saved-scan-meta">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span className="saved-badge-tag"><Check size={12} /> Saved Report</span>
+                <strong>{viewingSavedScan.productName}</strong>
+                {viewingSavedScan.brand && <span style={{ color: '#687765' }}>({viewingSavedScan.brand})</span>}
+              </div>
+              <span>
+                Saved {formatScanDate(viewingSavedScan.createdAt)} • Safety score: <strong>{viewingSavedScan.safetyScore}/100</strong> ({viewingSavedScan.overallRisk} risk)
+              </span>
+            </div>
+            <button type="button" className="close-scan-btn" onClick={closeSavedScan}>
+              <RotateCcw size={13} /> New scan
+            </button>
+          </div>
+        )}
+        {extractedText ? <><p className="results-note">Check the transcription against the package. For best results, upload a sharp, well-lit image with the full ingredient list in frame.</p><pre className="extracted-text extracted-readonly" aria-label="Extracted ingredient text">{extractedText}</pre><div className="result-footer"><span>Image text extracted by Gemini</span><button className="reset-button" type="button" onClick={resetScan}><RotateCcw size={14} /> Scan another image</button></div>{!viewingSavedScan && <div className="analysis-action"><div><strong>Ingredient screening</strong><span>Get a general AI estimate of potential concerns.</span></div><button className="extract-button analyze-button" type="button" disabled={analysisLoading || !extractedText.trim()} onClick={() => void analyzeIngredients()}>{analysisLoading ? <><span className="button-spinner" /> Reviewing ingredients...</> : <><ShieldCheck size={16} /> Categorize risks <ArrowRight size={16} /></>}</button></div>}{analysisError && <p className="auth-message error scanner-message" role="alert">{analysisError}</p>}{analysis && <div className="analysis-results"><div className="analysis-summary"><div><strong>Potential concern screening</strong>{viewingSavedScan && <span style={{ marginLeft: '8px', fontSize: '11px', color: '#57734f' }}>• Score: {viewingSavedScan.safetyScore}/100</span>}</div><span>{analysis.length} ingredients reviewed</span></div>{(() => { const { score, overallRisk } = calculateSafetyScore(analysis); return <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '6px', flexWrap: 'wrap' }}><span className="history-score" style={{ fontSize: '15px', color: '#33503a' }}>{viewingSavedScan ? viewingSavedScan.safetyScore : score}<small>/100</small></span><span className={`screening-badge screening-${viewingSavedScan ? viewingSavedScan.overallRisk : overallRisk}`}>Overall {viewingSavedScan ? viewingSavedScan.overallRisk : overallRisk} concern</span>{savingScan && <span style={{ fontSize: '10px', color: '#688460', display: 'inline-flex', alignItems: 'center', gap: '4px' }}><span className="spinner" style={{ width: '10px', height: '10px' }} /> Saving to history...</span>}{saveMessage && <span style={{ fontSize: '10px', color: '#4f7449' }}>• {saveMessage}</span>}</div> })()}<div className="analysis-totals"><span className="screening-badge screening-low">Low {analysis.filter((item) => item.level === 'low').length}</span><span className="screening-badge screening-medium">Medium {analysis.filter((item) => item.level === 'medium').length}</span><span className="screening-badge screening-high">High {analysis.filter((item) => item.level === 'high').length}</span></div><p className="analysis-disclaimer">AI-generated general screening only. Ingredient risk depends on concentration, formula, how the product is used, and individual sensitivity. This is not medical advice or a regulatory assessment.</p><div className="ingredient-screenings">{analysis.map((item, index) => <article className="ingredient-screening" key={`${index}-${item.ingredient}`}><div className="ingredient-screening-title"><strong>{item.ingredient}</strong><span className={`screening-badge screening-${item.level}`}>{item.level} potential concern</span></div><p>{item.reason}</p><span className="screening-confidence">AI confidence: {item.confidence}</span></article>)}</div>{!viewingSavedScan && <button type="button" className="reset-button rerun-button" onClick={() => void analyzeIngredients()} disabled={analysisLoading}><RotateCcw size={14} /> Re-run screening</button>}</div>}</> : <div className="results-empty"><span className="empty-result-icon"><FlaskConical size={19} /></span><strong>Your extracted text will appear here</strong><span>Upload an ingredient list image to get started. The transcription appears here for reference and copying.</span></div>}
+      </section>
+
+      <section className="history-section" aria-labelledby="history-title">
+        <div className="history-heading">
+          <div>
+            <h2 id="history-title">Scan History</h2>
+            <p>Your previously analyzed skincare products and safety evaluations.</p>
+          </div>
+          <span className="history-count">
+            {scans.length} {scans.length === 1 ? 'scan' : 'scans'}
+          </span>
+        </div>
+
+        {historyLoading && (
+          <div className="history-empty" role="status">
+            <span className="spinner" />
+            <strong>Loading your scan history...</strong>
+            <span>Retrieving saved reports from Firestore</span>
+          </div>
+        )}
+
+        {historyError && (
+          <div className="auth-message error" style={{ marginTop: '16px' }} role="alert">
+            <span>{historyError}</span>
+            <button
+              type="button"
+              className="browse-button"
+              style={{ marginLeft: 'auto', padding: '5px 10px' }}
+              onClick={loadHistory}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {!historyLoading && !historyError && scans.length === 0 && (
+          <div className="history-empty">
+            <span className="empty-icon"><FlaskConical size={20} /></span>
+            <strong>No previous scans found</strong>
+            <span>Upload an ingredient list image above to analyze risks. Your scans will be automatically saved here.</span>
+          </div>
+        )}
+
+        {!historyLoading && !historyError && scans.length > 0 && (
+          <div className="scan-list" role="list" aria-label="Previous product scans">
+            {scans.map((scan) => (
+              <button
+                key={scan.id}
+                type="button"
+                role="listitem"
+                className={`history-card ${viewingSavedScan?.id === scan.id ? 'active-history-card' : ''}`}
+                onClick={() => openSavedScan(scan)}
+                aria-label={`Open scan for ${scan.productName}`}
+              >
+                <span
+                  className={`risk-dot ${
+                    scan.overallRisk === 'high'
+                      ? 'risk-high'
+                      : scan.overallRisk === 'medium'
+                      ? 'risk-medium'
+                      : ''
+                  }`}
+                />
+                <div className="history-product">
+                  <strong>{scan.productName}</strong>
+                  <span>
+                    {scan.brand ? `${scan.brand} • ` : ''}
+                    {scan.summary || `${scan.ingredients.length} ingredients`} • {formatScanDate(scan.createdAt)}
+                  </span>
+                </div>
+                <span
+                  className={`risk-label ${
+                    scan.overallRisk === 'high'
+                      ? 'risk-text-high'
+                      : scan.overallRisk === 'medium'
+                      ? 'risk-text-medium'
+                      : ''
+                  }`}
+                >
+                  {scan.overallRisk} risk
+                </span>
+                <span className="history-score">
+                  {scan.safetyScore}
+                  <small>/100</small>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
       </section>
     </section>
   </main>

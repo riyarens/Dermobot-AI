@@ -1,6 +1,6 @@
-# Firebase Authentication setup
+# Firebase Authentication & Cloud Firestore Setup
 
-This project uses Firebase Authentication with email and password. It does not configure or use Firestore.
+This project uses **Firebase Authentication** (email/password) and **Cloud Firestore** for storing each user's private scan history and safety assessments.
 
 ## Connect your Firebase project
 
@@ -17,7 +17,30 @@ This project uses Firebase Authentication with email and password. It does not c
 
 4. In **Authentication → Sign-in method**, enable **Email/Password**.
 5. Add your development and production hostnames under **Authentication → Settings → Authorized domains**.
-6. Restart Vite after saving `.env.local`.
+6. In **Build → Firestore Database**, click **Create database** (choose your preferred region, e.g., standard production mode).
+7. Go to the **Rules** tab in Cloud Firestore and paste the contents of `firestore.rules`, then click **Publish**:
+   ```javascript
+   rules_version = '2';
+
+   service cloud.firestore {
+     match /databases/{database}/documents {
+       // Default deny
+       match /{document=**} {
+         allow read, write: if false;
+       }
+
+       // Authenticated users can only access their own scans
+       match /users/{userId} {
+         allow read, write: if request.auth != null && request.auth.uid == userId;
+
+         match /scans/{scanId} {
+           allow read, write: if request.auth != null && request.auth.uid == userId;
+         }
+       }
+     }
+   }
+   ```
+8. Restart Vite after saving `.env.local`.
 
 Firebase web configuration values identify your project and are intended for browser apps. Do not put Gemini secret keys, service account credentials, or other server secrets in `VITE_` variables.
 

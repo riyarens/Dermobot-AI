@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import sharp from 'sharp'
 
 const port = Number(process.env.API_PORT || 8787)
-const projectId = process.env.FIREBASE_PROJECT_ID
+const projectId = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID
 const apiKey = process.env.GEMINI_API_KEY
 const model = process.env.GEMINI_VISION_MODEL || 'gemini-3.8-flash'
 const processedImagesDir = join(dirname(fileURLToPath(import.meta.url)), 'uploads', 'processed')
