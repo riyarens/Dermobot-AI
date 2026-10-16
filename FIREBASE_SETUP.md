@@ -32,8 +32,10 @@ Set these server-side environment variables (never prefix them with `VITE_`):
 ```text
 GEMINI_API_KEY=...
 FIREBASE_PROJECT_ID=your-project-id
-# Optional; defaults to gemini-3.8-flash
+# Optional; primary defaults to gemini-3.8-flash
 GEMINI_VISION_MODEL=gemini-3.8-flash
+# Optional; overloaded primary (503) falls back to this model
+GEMINI_FALLBACK_MODEL=gemini-3.5-flash-lite
 ```
 
 Run the API and Vite in separate terminals from the project root:
@@ -44,5 +46,7 @@ npm run dev
 ```
 
 The API listens on port 8787 by default and Vite proxies `/api` requests to it. Set `API_PORT` on the server if you need another port, and update the Vite proxy accordingly. The server validates Firebase ID tokens against the configured project before calling the vision API.
+
+Transient Gemini 503 errors are retried with exponential backoff. If the primary model remains overloaded, the API tries `GEMINI_FALLBACK_MODEL` (defaults to `gemini-3.5-flash-lite`), which supports image input and structured output. Change either model ID in `.env.local` if needed, then restart the API.
 
 For OCR, the API auto-rotates, enlarges, normalizes, sharpens, and compresses uploads to WebP using Sharp. Temporary processed images are written to `server/uploads/processed/` only while the OCR request runs and are deleted when it finishes. The transcription is displayed read-only; users can copy it or scan another image.

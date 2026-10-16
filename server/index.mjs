@@ -9,12 +9,45 @@ const port = Number(process.env.API_PORT || 8787)
 const projectId = process.env.FIREBASE_PROJECT_ID
 const apiKey = process.env.GEMINI_API_KEY
 const model = process.env.GEMINI_VISION_MODEL || 'gemini-3.8-flash'
+const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite'
 const processedImagesDir = join(dirname(fileURLToPath(import.meta.url)), 'uploads', 'processed')
 let certCache = { expires: 0, keys: {} }
 
 function send(response, status, body) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
   response.end(JSON.stringify(body))
+}
+
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+async function fetchGeminiWithRetry(url, options) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const response = await fetch(url, options)
+      if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === 3) return response
+      const retryAfter = Number(response.headers.get('retry-after'))
+      await response.body?.cancel()
+      await delay(Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 10000) : 700 * (2 ** attempt) + Math.random() * 300)
+    } catch (error) {
+      if (attempt === 3) throw error
+      await delay(700 * (2 ** attempt) + Math.random() * 300)
+    }
+  }
+  throw new Error('Gemini is temporarily unavailable.')
+}
+
+async function fetchGeminiWithFallback(options) {
+  const models = [...new Set([model, fallbackModel])]
+  let response
+  for (let index = 0; index < models.length; index += 1) {
+    const candidateModel = models[index]
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidateModel)}:generateContent`
+    response = await fetchGeminiWithRetry(endpoint, options)
+    if (response.status !== 503 || index === models.length - 1) return response
+    console.warn(`Gemini model ${candidateModel} is overloaded; trying ${models[index + 1]}.`)
+    await response.body?.cancel()
+  }
+  return response
 }
 
 async function verifyFirebaseToken(token) {
@@ -59,7 +92,7 @@ async function extract(request, response) {
     const ingredients = payload.text.split(/[,;\n]+/).map((value) => value.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim()).filter(Boolean).slice(0, 100)
     if (!ingredients.length) return send(response, 400, { error: 'No ingredient names were found in the text.' })
     try {
-      const result = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      const result = await fetchGeminiWithFallback({
         method: 'POST',
         headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -113,21 +146,54 @@ async function extract(request, response) {
     try {
       await sharp(imageBuffer, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 3000, height: 6000, fit: 'inside' }).normalise().sharpen().webp({ quality: 92, effort: 4 }).toFile(processedPath)
       const processedImage = (await readFile(processedPath)).toString('base64')
-    const result = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ generationConfig: { temperature: 0, maxOutputTokens: 1200 }, contents: [{ parts: [
-        { text: 'Transcribe the complete ingredient list visible in this image, including small print. Preserve spelling, punctuation, and order. Read all visible lines and columns in natural reading order. Do not identify, complete, correct, infer, or add any ingredient. If a portion is illegible, transcribe the readable portions and omit only the unreadable text; do not guess. If no ingredient list is legible, return an empty string. Return only the transcription, without commentary.' },
-        { inline_data: { mime_type: 'image/webp', data: processedImage } },
-      ] }] }),
-    })
-    const data = await result.json()
-    if (!result.ok) {
-      const message = data?.error?.message || 'The vision service could not process this image.'
-      return send(response, result.status === 429 ? 429 : 502, { error: message })
-    }
-    const text = data?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('')
-    return send(response, 200, { text: typeof text === 'string' ? text.trim() : '' })
+      const prompt = 'Read and transcribe the complete cosmetic ingredient list in the image or image tiles. Look closely for small printed text and labels such as Ingredients or INCI. Preserve spelling, punctuation, and order. If multiple overlapping tiles are supplied, combine them into one list in natural reading order and do not repeat text visible in more than one tile. Do not identify, correct, complete, infer, or add ingredients. If only part is readable, return the readable part without guessing. Return only the transcription.'
+      async function transcribe(data, type) {
+        const imageParts = Array.isArray(data)
+          ? data.map((tile) => ({ inline_data: { mime_type: 'image/webp', data: tile } }))
+          : [{ inline_data: { mime_type: type, data } }]
+        const result = await fetchGeminiWithFallback({
+          method: 'POST',
+          headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ generationConfig: { temperature: 0, maxOutputTokens: 2000 }, contents: [{ parts: [
+            { text: prompt },
+            ...imageParts,
+          ] }] }),
+        })
+        const payload = await result.json()
+        if (!result.ok) return { error: payload?.error?.message || 'Gemini could not process this image.', status: result.status }
+        const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('').trim() ?? ''
+        if (!text) console.warn('Gemini returned no transcription text', { model, finishReason: payload?.candidates?.[0]?.finishReason, blockReason: payload?.promptFeedback?.blockReason })
+        return { text }
+      }
+
+      // Preserve the original detail first, then try the enhanced copy.
+      let transcription = await transcribe(image, mimeType)
+      if (transcription.error) return send(response, transcription.status === 429 ? 429 : 502, { error: transcription.error })
+      if (!transcription.text) transcription = await transcribe(processedImage, 'image/webp')
+      if (transcription.error) return send(response, transcription.status === 429 ? 429 : 502, { error: transcription.error })
+      // Close-up tiles help when the ingredient panel occupies only a small area of the photo.
+      if (!transcription.text) {
+        const { data: orientedImage, info } = await sharp(imageBuffer).rotate().toBuffer({ resolveWithObject: true })
+        const columns = info.width > 2200 ? 2 : 1
+        const rows = info.height > 2200 ? 2 : 1
+        const tileBuffers = []
+        for (let row = 0; row < rows; row += 1) {
+          for (let column = 0; column < columns; column += 1) {
+            const cellLeft = Math.floor(column * info.width / columns)
+            const cellTop = Math.floor(row * info.height / rows)
+            const cellRight = Math.ceil((column + 1) * info.width / columns)
+            const cellBottom = Math.ceil((row + 1) * info.height / rows)
+            const left = Math.max(0, cellLeft - 100)
+            const top = Math.max(0, cellTop - 100)
+            const right = Math.min(info.width, cellRight + 100)
+            const bottom = Math.min(info.height, cellBottom + 100)
+            tileBuffers.push(await sharp(orientedImage).extract({ left, top, width: right - left, height: bottom - top }).resize({ width: 2400, height: 2400, fit: 'inside' }).normalise().sharpen().webp({ quality: 88 }).toBuffer())
+          }
+        }
+        transcription = await transcribe(tileBuffers.map((tile) => tile.toString('base64')), 'image/webp')
+        if (transcription.error) return send(response, transcription.status === 429 ? 429 : 502, { error: transcription.error })
+      }
+      return send(response, 200, { text: transcription.text || '' })
     } finally {
       await unlink(processedPath).catch(() => undefined)
     }
@@ -136,6 +202,6 @@ async function extract(request, response) {
   }
 }
 
-createServer((request, response) => { void extract(request, response) }).listen(port, () => {
+createServer((request, response) => { void extract(request, response) }).listen(port, '127.0.0.1', () => {
   console.log(`Dermobot OCR API listening on http://localhost:${port}`)
 })

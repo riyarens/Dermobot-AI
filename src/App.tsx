@@ -8,6 +8,19 @@ import { auth, firebaseConfigured } from './firebase'
 type Mode = 'login' | 'signup'
 type IngredientScreening = { ingredient: string; level: 'low' | 'medium' | 'high'; confidence: 'low' | 'medium' | 'high'; reason: string }
 
+async function readApiResponse<T extends { error?: string }>(response: Response): Promise<T> {
+  const body = await response.text()
+  let payload: T
+  try { payload = JSON.parse(body) as T }
+  catch {
+    throw new Error(response.ok
+      ? 'The scanner API returned an unreadable response. Check the API terminal and try again.'
+      : `The scanner API returned an unexpected response (${response.status}). Make sure npm run dev:api is running.`)
+  }
+  if (!response.ok) throw new Error(payload.error || `Scanner request failed (${response.status}).`)
+  return payload
+}
+
 function Brand() {
   return <a className="brand" href="/" aria-label="Dermobot home">
     <span className="brand-mark"><Sparkles size={18} strokeWidth={2.3} /></span>
@@ -221,10 +234,9 @@ function DashboardPage() {
         reader.readAsDataURL(selectedImage)
       })
       const response = await fetch('/api/extract', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ image: imageData, mimeType: selectedImage.type }) })
-      const payload = await response.json() as { text?: string; error?: string }
-      if (!response.ok) throw new Error(payload.error || 'OCR request failed')
+      const payload = await readApiResponse<{ text?: string; error?: string }>(response)
       const text = (payload.text ?? '').trim()
-      if (!text) setOcrError('No readable text was found. Try a sharper, well-lit photo with the ingredient list in focus.')
+      if (!text) setOcrError('Gemini returned no ingredient text from the original or enhanced image. Try a close crop of the ingredient panel, or a higher-resolution photo.')
       else setExtractedText(text)
     } catch (caught) {
       setOcrError(caught instanceof Error ? caught.message : 'We could not read this image. Please try again or upload a clearer photo.')
@@ -242,8 +254,7 @@ function DashboardPage() {
       if (!auth?.currentUser) throw new Error('Your session has expired. Please sign in again.')
       const token = await auth.currentUser.getIdToken()
       const response = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ text: extractedText }) })
-      const payload = await response.json() as { items?: IngredientScreening[]; error?: string }
-      if (!response.ok) throw new Error(payload.error || 'Ingredient screening failed')
+      const payload = await readApiResponse<{ items?: IngredientScreening[]; error?: string }>(response)
       setAnalysis(payload.items ?? [])
     } catch (caught) {
       setAnalysisError(caught instanceof Error ? caught.message : 'Could not analyze these ingredients. Please retry.')
