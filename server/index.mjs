@@ -102,16 +102,18 @@ async function extract(request, response) {
             responseMimeType: 'application/json',
             responseSchema: {
               type: 'OBJECT',
-              properties: { items: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
+              properties: { overview: { type: 'STRING' }, items: { type: 'ARRAY', items: { type: 'OBJECT', properties: {
                 index: { type: 'INTEGER' },
                 level: { type: 'STRING', enum: ['low', 'medium', 'high'] },
                 reason: { type: 'STRING' },
                 confidence: { type: 'STRING', enum: ['low', 'medium', 'high'] },
+                whatItIs: { type: 'STRING' },
+                commonUses: { type: 'STRING' },
               }, required: ['index', 'level', 'reason', 'confidence'] } } },
-              required: ['items'],
+              required: ['overview', 'items'],
             },
           },
-          contents: [{ parts: [{ text: `Provide a cautious, general-purpose AI screening of these cosmetic ingredient names. This is not medical advice, a regulatory determination, or an evaluation of a finished formula. A label means potential concern only; actual safety depends on concentration, formulation, exposure, product type, and individual sensitivity. Do not make up hazards, benefits, regulations, citations, or ingredient identities. If reliable general knowledge is insufficient to assess an ingredient, use level "medium", confidence "low", and say that information is insufficient. Use "high" only for a well-established significant concern at typical cosmetic use; "medium" for context-dependent or recognized irritation/sensitivity concerns; "low" only when no notable concern is generally recognized at typical cosmetic use. These categories are rough screening signals, not probability or severity scores. Return one item for each supplied ingredient, using its zero-based index. Explain briefly and cautiously. Keep the supplied order. Ingredients: ${JSON.stringify(ingredients)}` }] }],
+          contents: [{ parts: [{ text: `Provide a cautious, general-purpose AI screening of these cosmetic ingredient names. This is not medical advice, a regulatory determination, or an evaluation of a finished formula. A label means potential concern only; actual safety depends on concentration, formulation, exposure, product type, and individual sensitivity. Do not make up hazards, benefits, regulations, citations, or ingredient identities. If reliable general knowledge is insufficient to assess an ingredient, use level "medium", confidence "low", and say that information is insufficient. Use "high" only for a well-established significant concern at typical cosmetic use; "medium" for context-dependent or recognized irritation/sensitivity concerns; "low" only when no notable concern is generally recognized at typical cosmetic use. These categories are rough screening signals, not probability or severity scores. For each ingredient, briefly explain what the substance is and its common cosmetic purpose. If identity or use is uncertain from the name, explicitly say that it cannot be reliably determined; do not guess. Also provide a short overall overview of the ingredient list: summarize the main ingredient functions and likely product type only if the names support it. If the product type is not clear from the list, say that it cannot be determined from the ingredients alone. Do not claim product efficacy or overall safety. Keep the overview to 2 sentences and use only the supplied ingredient names. Return one item for each supplied ingredient, using its zero-based index. Keep the supplied order. Ingredients: ${JSON.stringify(ingredients)}` }] }],
         }),
       })
       const data = await result.json()
@@ -127,9 +129,17 @@ async function extract(request, response) {
         const item = byIndex.get(index)
         const level = ['low', 'medium', 'high'].includes(item?.level) ? item.level : 'medium'
         const confidence = ['low', 'medium', 'high'].includes(item?.confidence) ? item.confidence : 'low'
-        return { ingredient, level, confidence, reason: typeof item?.reason === 'string' ? item.reason.slice(0, 400) : 'Insufficient information for a reliable screening.' }
+        return {
+          ingredient,
+          level,
+          confidence,
+          reason: typeof item?.reason === 'string' ? item.reason.slice(0, 400) : 'Insufficient information for a reliable screening.',
+          whatItIs: typeof item?.whatItIs === 'string' ? item.whatItIs.slice(0, 300) : 'Could not reliably identify this ingredient from its name alone.',
+          commonUses: typeof item?.commonUses === 'string' ? item.commonUses.slice(0, 300) : 'Common cosmetic use could not be reliably determined.',
+        }
       })
-      return send(response, 200, { items })
+      const overview = typeof parsed.overview === 'string' ? parsed.overview.trim().slice(0, 500) : ''
+      return send(response, 200, { overview, items })
     } catch {
       return send(response, 502, { error: 'Could not analyze the ingredient list. Please retry in a moment.' })
     }
@@ -146,24 +156,29 @@ async function extract(request, response) {
     try {
       await sharp(imageBuffer, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 3000, height: 6000, fit: 'inside' }).normalise().sharpen().webp({ quality: 92, effort: 4 }).toFile(processedPath)
       const processedImage = (await readFile(processedPath)).toString('base64')
-      const prompt = 'Read and transcribe the complete cosmetic ingredient list in the image or image tiles. Look closely for small printed text and labels such as Ingredients or INCI. Preserve spelling, punctuation, and order. If multiple overlapping tiles are supplied, combine them into one list in natural reading order and do not repeat text visible in more than one tile. Do not identify, correct, complete, infer, or add ingredients. If only part is readable, return the readable part without guessing. Return only the transcription.'
-      async function transcribe(data, type) {
+      const prompt = 'Read and transcribe the cosmetic ingredient list in the image. Look closely for small printed text and labels such as Ingredients or INCI. Preserve spelling, punctuation, and order. If multiple overlapping tiles are supplied, combine them into one list in natural reading order and do not repeat text visible in more than one tile. Do not identify, correct, complete, infer, or add ingredients. If only part is readable, return the readable part without guessing. Also set complete=true only when the entire ingredient panel/list is visibly present and legible; if the image is cropped, cut off, partly unreadable, or you are uncertain, set complete=false. Return JSON with text and complete.'
+      async function transcribe(data, type, canAssessFullPanel = true) {
         const imageParts = Array.isArray(data)
           ? data.map((tile) => ({ inline_data: { mime_type: 'image/webp', data: tile } }))
           : [{ inline_data: { mime_type: type, data } }]
         const result = await fetchGeminiWithFallback({
           method: 'POST',
           headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ generationConfig: { temperature: 0, maxOutputTokens: 2000 }, contents: [{ parts: [
+          body: JSON.stringify({ generationConfig: { temperature: 0, maxOutputTokens: 2000, responseMimeType: 'application/json', responseSchema: {
+            type: 'OBJECT', properties: { text: { type: 'STRING' }, complete: { type: 'BOOLEAN' } }, required: ['text', 'complete'],
+          } }, contents: [{ parts: [
             { text: prompt },
             ...imageParts,
           ] }] }),
         })
         const payload = await result.json()
         if (!result.ok) return { error: payload?.error?.message || 'Gemini could not process this image.', status: result.status }
-        const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('').trim() ?? ''
+        const rawText = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('').trim() ?? ''
+        let parsed
+        try { parsed = JSON.parse(rawText || '{}') } catch { parsed = {} }
+        const text = typeof parsed.text === 'string' ? parsed.text.trim() : ''
         if (!text) console.warn('Gemini returned no transcription text', { model, finishReason: payload?.candidates?.[0]?.finishReason, blockReason: payload?.promptFeedback?.blockReason })
-        return { text }
+        return { text, complete: canAssessFullPanel && parsed.complete === true }
       }
 
       // Preserve the original detail first, then try the enhanced copy.
@@ -190,10 +205,10 @@ async function extract(request, response) {
             tileBuffers.push(await sharp(orientedImage).extract({ left, top, width: right - left, height: bottom - top }).resize({ width: 2400, height: 2400, fit: 'inside' }).normalise().sharpen().webp({ quality: 88 }).toBuffer())
           }
         }
-        transcription = await transcribe(tileBuffers.map((tile) => tile.toString('base64')), 'image/webp')
+        transcription = await transcribe(tileBuffers.map((tile) => tile.toString('base64')), 'image/webp', false)
         if (transcription.error) return send(response, transcription.status === 429 ? 429 : 502, { error: transcription.error })
       }
-      return send(response, 200, { text: transcription.text || '' })
+      return send(response, 200, { text: transcription.text || '', complete: transcription.complete === true })
     } finally {
       await unlink(processedPath).catch(() => undefined)
     }

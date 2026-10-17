@@ -7,12 +7,13 @@ import {
   serverTimestamp,
   type Firestore,
 } from 'firebase/firestore'
-
 export interface IngredientScreening {
   ingredient: string
   level: 'low' | 'medium' | 'high'
   confidence: 'low' | 'medium' | 'high'
   reason: string
+  whatItIs?: string
+  commonUses?: string
 }
 
 export interface ScanRecord {
@@ -21,6 +22,8 @@ export interface ScanRecord {
   brand: string
   ingredients: string[]
   extractedText: string
+  overview?: string
+  ingredientListComplete?: boolean
   riskClassifications: IngredientScreening[]
   safetyScore: number
   overallRisk: 'low' | 'medium' | 'high'
@@ -33,37 +36,50 @@ export interface SaveScanInput {
   brand: string
   ingredients?: string[]
   extractedText: string
+  overview?: string
+  ingredientListComplete?: boolean
   riskClassifications: IngredientScreening[]
   safetyScore?: number
   overallRisk?: 'low' | 'medium' | 'high'
   summary?: string
 }
 
-export function calculateSafetyScore(items: IngredientScreening[]): {
+export function calculateSafetyScore(items: IngredientScreening[], verifiedRegulatoryPenalty = 0): {
   score: number
+  baseScore: number
+  regulatoryPenalty: number
   overallRisk: 'low' | 'medium' | 'high'
   summary: string
   counts: { low: number; medium: number; high: number }
 } {
+  const severity = { low: 0, medium: 1, high: 2 } as const
+  const distinctByName = new Map<string, IngredientScreening>()
+  for (const item of items) {
+    const key = item.ingredient.toLowerCase().replace(/[^a-z0-9]+/g, '')
+    const current = distinctByName.get(key)
+    if (!current || severity[item.level] > severity[current.level]) distinctByName.set(key, item)
+  }
+  const uniqueItems = [...distinctByName.values()]
   const counts = {
-    low: items.filter((i) => i.level === 'low').length,
-    medium: items.filter((i) => i.level === 'medium').length,
-    high: items.filter((i) => i.level === 'high').length,
+    low: uniqueItems.filter((i) => i.level === 'low').length,
+    medium: uniqueItems.filter((i) => i.level === 'medium').length,
+    high: uniqueItems.filter((i) => i.level === 'high').length,
   }
-  const total = items.length
 
-  let score = 100
-  if (total > 0) {
-    const rawScore = (counts.low * 100 + counts.medium * 60 + counts.high * 20) / total
-    score = Math.max(0, Math.min(100, Math.round(rawScore)))
-  }
+  const weightSum = counts.low * 0.5 + counts.medium * 2.5 + counts.high * 5
+  const baseScore = uniqueItems.length > 0
+    ? Math.round(100 * (1 - weightSum / (5 * uniqueItems.length)))
+    : 0
+  const regulatoryPenalty = Math.max(0, verifiedRegulatoryPenalty)
+  const score = Math.max(0, baseScore - regulatoryPenalty)
 
   const overallRisk: 'low' | 'medium' | 'high' =
     counts.high > 0 ? 'high' : counts.medium > 0 ? 'medium' : 'low'
 
-  const summary = `${total} ingredients reviewed • ${counts.low} low, ${counts.medium} medium, ${counts.high} high concern`
+  const total = uniqueItems.length
+  const summary = `${total} distinct ingredients reviewed • ${counts.low} low, ${counts.medium} moderate, ${counts.high} high concern`
 
-  return { score, overallRisk, summary, counts }
+  return { score, baseScore, regulatoryPenalty, overallRisk, summary, counts }
 }
 
 export async function saveScanRecord(
@@ -83,6 +99,8 @@ export async function saveScanRecord(
     brand: input.brand.trim() || '',
     ingredients,
     extractedText: input.extractedText,
+    overview: input.overview || '',
+    ingredientListComplete: input.ingredientListComplete === true,
     riskClassifications: input.riskClassifications,
     safetyScore: typeof input.safetyScore === 'number' ? input.safetyScore : score,
     overallRisk: input.overallRisk || overallRisk,
@@ -139,6 +157,8 @@ export async function getUserScanHistory(
       brand: typeof data.brand === 'string' ? data.brand : '',
       ingredients: Array.isArray(data.ingredients) ? data.ingredients : [],
       extractedText: typeof data.extractedText === 'string' ? data.extractedText : '',
+      overview: typeof data.overview === 'string' ? data.overview : '',
+      ingredientListComplete: data.ingredientListComplete === true,
       riskClassifications: Array.isArray(data.riskClassifications)
         ? data.riskClassifications
         : [],
