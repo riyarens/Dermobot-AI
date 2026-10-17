@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut, updateProfile } from 'firebase/auth'
-import { ArrowRight, Check, Eye, EyeOff, FlaskConical, ImagePlus, Leaf, LockKeyhole, LogOut, Mail, ShieldCheck, Sparkles, Upload, X, RotateCcw } from 'lucide-react'
+import { ArrowRight, Check, Eye, EyeOff, FlaskConical, ImagePlus, Leaf, LockKeyhole, LogOut, Mail, Sparkles, Upload, X } from 'lucide-react'
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import { auth, db, firebaseConfigured } from './firebase'
-import { regulatoryIngredients, toxicityCategories } from './data/regulatoryIngredients'
+import { type RegulatoryIngredient, regulatoryIngredients, toxicityCategories } from './data/regulatoryIngredients'
 import { applyRiskCategories } from './lib/riskClassification'
 import {
   type IngredientScreening,
@@ -75,11 +75,11 @@ async function readApiResponse<T extends { error?: string }>(response: Response)
   return payload
 }
 
-function RegulatoryIngredientList({ title, items }: { title: string; items: { name: string; conditions: string }[] }) {
+function RegulatoryIngredientList({ title, items }: { title: string; items: RegulatoryIngredient[] }) {
   return <div className="regulatory-list">
     <h3>{title} <span>{items.length}</span></h3>
     {items.length ? <ul>{items.map((item) => <li key={item.name}>
-      <strong>{item.name}</strong>{'foundIn' in item && item.foundIn && <span>Found in: {item.foundIn}</span>}{item.conditions && <span>{item.conditions}</span>}
+      <strong>{item.name}</strong>{item.foundIn ? <span>Found in: {item.foundIn}</span> : null}{item.conditions ? <span>{item.conditions}</span> : null}
     </li>)}</ul> : <p>No items listed.</p>}
   </div>
 }
@@ -441,11 +441,6 @@ function DashboardPage() {
     savedScanSignature.current = `${user?.uid}_${(scan.extractedText || '').trim()}_${scan.productName.trim()}`
     navigate('/dashboard/report')
     window.scrollTo({ top: 0, behavior: 'smooth' })
-  }
-
-  function closeSavedScan() {
-    setViewingSavedScan(null)
-    resetScan()
   }
 
   function formatScanDate(millis: number) {

@@ -1,8 +1,5 @@
 import { createServer } from 'node:http'
-import { createPublicKey, randomUUID, verify as verifySignature } from 'node:crypto'
-import { mkdir, readFile, unlink } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { createPublicKey, verify as verifySignature } from 'node:crypto'
 import sharp from 'sharp'
 
 const port = Number(process.env.API_PORT || 8787)
@@ -10,7 +7,6 @@ const projectId = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_P
 const apiKey = process.env.GEMINI_API_KEY
 const model = process.env.GEMINI_VISION_MODEL || 'gemini-3.8-flash'
 const fallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite'
-const processedImagesDir = join(dirname(fileURLToPath(import.meta.url)), 'uploads', 'processed')
 let certCache = { expires: 0, keys: {} }
 
 function send(response, status, body) {
@@ -151,12 +147,9 @@ async function extract(request, response) {
   try {
     const imageBuffer = Buffer.from(image, 'base64')
     if (!imageBuffer.length) return send(response, 400, { error: 'The selected image could not be read.' })
-    const processedPath = join(processedImagesDir, `${randomUUID()}.webp`)
-    await mkdir(processedImagesDir, { recursive: true })
-    try {
-      await sharp(imageBuffer, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 3000, height: 6000, fit: 'inside' }).normalise().sharpen().webp({ quality: 92, effort: 4 }).toFile(processedPath)
-      const processedImage = (await readFile(processedPath)).toString('base64')
-      const prompt = 'Read and transcribe the cosmetic ingredient list in the image. Look closely for small printed text and labels such as Ingredients or INCI. Preserve spelling, punctuation, and order. If multiple overlapping tiles are supplied, combine them into one list in natural reading order and do not repeat text visible in more than one tile. Do not identify, correct, complete, infer, or add ingredients. If only part is readable, return the readable part without guessing. Also set complete=true only when the entire ingredient panel/list is visibly present and legible; if the image is cropped, cut off, partly unreadable, or you are uncertain, set complete=false. Return JSON with text and complete.'
+    const processedBuffer = await sharp(imageBuffer, { limitInputPixels: 40_000_000 }).rotate().resize({ width: 3000, height: 6000, fit: 'inside' }).normalise().sharpen().webp({ quality: 92, effort: 4 }).toBuffer()
+    const processedImage = processedBuffer.toString('base64')
+    const prompt = 'Read and transcribe the cosmetic ingredient list in the image. Look closely for small printed text and labels such as Ingredients or INCI. Preserve spelling, punctuation, and order. If multiple overlapping tiles are supplied, combine them into one list in natural reading order and do not repeat text visible in more than one tile. Do not identify, correct, complete, infer, or add ingredients. If only part is readable, return the readable part without guessing. Also set complete=true only when the entire ingredient panel/list is visibly present and legible; if the image is cropped, cut off, partly unreadable, or you are uncertain, set complete=false. Return JSON with text and complete.'
       async function transcribe(data, type, canAssessFullPanel = true) {
         const imageParts = Array.isArray(data)
           ? data.map((tile) => ({ inline_data: { mime_type: 'image/webp', data: tile } }))
@@ -208,10 +201,7 @@ async function extract(request, response) {
         transcription = await transcribe(tileBuffers.map((tile) => tile.toString('base64')), 'image/webp', false)
         if (transcription.error) return send(response, transcription.status === 429 ? 429 : 502, { error: transcription.error })
       }
-      return send(response, 200, { text: transcription.text || '', complete: transcription.complete === true })
-    } finally {
-      await unlink(processedPath).catch(() => undefined)
-    }
+    return send(response, 200, { text: transcription.text || '', complete: transcription.complete === true })
   } catch {
     return send(response, 502, { error: 'Could not prepare or read this image. Try a clearer JPG, PNG, or WEBP image.' })
   }
